@@ -934,7 +934,7 @@ static uint32_t gpu_tex_hash(const Texture *t)
         for (i = 0; i < 1024; i += env_cached("RECOMP_TEX_FULLHASH") ? 4 : 16)
             h = (h ^ *(const uint32_t *)(mem + t->palette + i)) * 16777619u;
     if (t->color == 0x0B && t->width == 128 && t->height == 128)
-        h ^= (uint32_t)prompt_style() * 0x5BD1E995u;   /* the button sheet follows the prompt style */
+        h ^= (uint32_t)prompt_style() * 0x5BD1E995u ^ (prompt_style() == 1 ? prompt_layout() * 0x27D4EB2Fu : 0u);   /* the button sheet follows the prompt style and button map */
     if ((tex_override_wants(t) & 2) && g_xbox_tex_override_gen)
         h ^= g_xbox_tex_override_gen() * 0x9E3779B1u;    /* its replacement changed */
     return h;
