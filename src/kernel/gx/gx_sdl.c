@@ -146,6 +146,10 @@ static struct {
  * GPU that is behind shows up here first. */
 static volatile LONGLONG s_gpu_wait_us;
 volatile long g_gx_presented_frames;    /* reached the swap chain (the driver trial, src/nfl2k5_gpu_driver.c) */
+/* Pipeline and frame counters for the log and the crash report (gx_crash_summary). */
+volatile LONG g_gx_pipe_made, g_gx_pipe_failed, g_gx_pipe_async_failed, g_gx_pipe_safe, g_gx_pipe_skipped;
+static volatile LONG s_draws_total;
+char g_gx_gpu_desc[320];                 /* "<device> | <driver> <version> | <info>" */
 LONGLONG gxs_gpu_wait_total_us(void) { return s_gpu_wait_us; }
 
 static double qpc_ms(void)
@@ -375,6 +379,19 @@ static int gx_sdl_init(int backend)
     fprintf(stderr, "  [GX] renderer on %s through SDL_GPU (driver %s, depth %s)\n",
             backend == 1 ? "Vulkan" : "Direct3D 12", SDL_GetGPUDeviceDriver(G.dev),
             G.depth_fmt == SDL_GPU_TEXTUREFORMAT_D32_FLOAT_S8_UINT ? "D32S8" : "D24S8");
+    {   /* which GPU and driver, in one line a player's log always has (and the crash report) */
+        SDL_PropertiesID dp = SDL_GetGPUDeviceProperties(G.dev);
+        const char *nm = dp ? SDL_GetStringProperty(dp, SDL_PROP_GPU_DEVICE_NAME_STRING, "?") : "?";
+        const char *dn = dp ? SDL_GetStringProperty(dp, SDL_PROP_GPU_DEVICE_DRIVER_NAME_STRING, "") : "";
+        const char *dv = dp ? SDL_GetStringProperty(dp, SDL_PROP_GPU_DEVICE_DRIVER_VERSION_STRING, "") : "";
+        const char *di = dp ? SDL_GetStringProperty(dp, SDL_PROP_GPU_DEVICE_DRIVER_INFO_STRING, "") : "";
+        char info[128];
+        size_t k;
+        snprintf(info, sizeof info, "%s", di ? di : "");
+        for (k = 0; info[k]; k++) if (info[k] == '\n' || info[k] == '\r') info[k] = ' ';
+        snprintf(g_gx_gpu_desc, sizeof g_gx_gpu_desc, "%s | %s %s | %s", nm ? nm : "?", dn ? dn : "", dv ? dv : "", info);
+        fprintf(stderr, "[GPU] %s\n", g_gx_gpu_desc);
+    }
     return 1;
 }
 
@@ -599,7 +616,7 @@ HRESULT gxs_ID3D11Device_CreateInputLayout(void *d, const D3D11_INPUT_ELEMENT_DE
 
 /* SDL objects that commands still waiting in the list refer to: released
  * once the list has been recorded (SDL then keeps them until the GPU is done). */
-enum { DR_TEX, DR_BUF, DR_SHADER, DR_SMP, DR_TB };
+enum { DR_TEX, DR_BUF, DR_SHADER, DR_SMP, DR_TB, DR_PIPE };
 static struct { int kind; void *p; } *s_dr;
 static int s_ndr, s_capdr;
 
@@ -633,6 +650,7 @@ static void run_releases(void)
         case DR_SHADER: SDL_ReleaseGPUShader(G.dev, (SDL_GPUShader *)s_dr[i].p); break;
         case DR_SMP:    SDL_ReleaseGPUSampler(G.dev, (SDL_GPUSampler *)s_dr[i].p); break;
         case DR_TB:     SDL_ReleaseGPUTransferBuffer(G.dev, (SDL_GPUTransferBuffer *)s_dr[i].p); break;
+        case DR_PIPE:   SDL_ReleaseGPUGraphicsPipeline(G.dev, (SDL_GPUGraphicsPipeline *)s_dr[i].p); break;
         }
     }
     s_ndr = keep;
@@ -1046,6 +1064,38 @@ static SDL_Condition *s_job_cond;
 static volatile LONG s_jobs_inflight;   /* queued or compiling */
 static int s_async_pipes = -1;
 static volatile LONG s_pipe_skips;      /* draws dropped since the last Present */
+/* Safety for GPU drivers that crash while compiling (2026-11-09, Adreno 740
+ * handhelds crashed at scene changes, when pipelines are made): with
+ * RECOMP_GX_PIPE_SERIAL=1 only one pipeline is compiled at a time, on one
+ * worker (RECOMP_GX_PIPE_WORKERS, 1 or 2). src/main.c sets them for those
+ * devices and after a crash. A pipeline the driver refuses is tried once more
+ * on the drawing thread, then once as a plainer variant (solid fill, depth
+ * clip on: the features some drivers lack), then remembered as failed so its
+ * draws are dropped without stalling or holding frames. Background compiles
+ * that keep failing turn themselves off for the rest of the run. */
+static SDL_Mutex *s_pipe_create_lock;
+static int s_pipe_serial, s_pipe_workers = 2;
+#define PIPE_FAILED 512
+static struct { GxPipeKey k; uint32_t h; } s_failed[PIPE_FAILED];
+static unsigned s_nfailed;
+
+static SDL_GPUGraphicsPipeline *gx_create_pipeline(const SDL_GPUGraphicsPipelineCreateInfo *ci)
+{
+    SDL_GPUGraphicsPipeline *p;
+    if (s_pipe_serial && s_pipe_create_lock) SDL_LockMutex(s_pipe_create_lock);
+    p = SDL_CreateGPUGraphicsPipeline(G.dev, ci);
+    if (p) InterlockedIncrement(&g_gx_pipe_made);
+    if (s_pipe_serial && s_pipe_create_lock) SDL_UnlockMutex(s_pipe_create_lock);
+    return p;
+}
+
+static int pipe_is_failed(const GxPipeKey *k, uint32_t h)
+{
+    unsigned i;
+    for (i = 0; i < s_nfailed; i++)
+        if (s_failed[i].h == h && !memcmp(&s_failed[i].k, k, sizeof *k)) return 1;
+    return 0;
+}
 
 static int pipe_job_worker(void *arg)
 {
@@ -1064,13 +1114,14 @@ static int pipe_job_worker(void *arg)
         SDL_UnlockMutex(s_job_lock);
         {
             Uint64 t0 = SDL_GetTicksNS();
-            SDL_GPUGraphicsPipeline *p = SDL_CreateGPUGraphicsPipeline(G.dev, &j->ci);
+            SDL_GPUGraphicsPipeline *p = gx_create_pipeline(&j->ci);
             Uint64 ms = (SDL_GetTicksNS() - t0) / 1000000u;
             static volatile LONG made;
             LONG n = InterlockedIncrement(&made);
-            if (n <= 3 || n % 200 == 0 || ms > 100)
-                fprintf(stderr, "  [GX] background pipeline #%ld took %llu ms%s\n", (long)n,
-                        (unsigned long long)ms, p ? "" : " (failed)");
+            if (!p) InterlockedIncrement(&g_gx_pipe_async_failed);
+            if (n <= 3 || n % 200 == 0 || ms > 100 || (!p && g_gx_pipe_async_failed <= 8))
+                fprintf(stderr, "  [GX] background pipeline #%ld took %llu ms%s%s%s\n", (long)n,
+                        (unsigned long long)ms, p ? "" : " (failed: ", p ? "" : SDL_GetError(), p ? "" : ")");
             SDL_LockMutex(s_job_lock);
             j->p = p;
             j->state = 3;
@@ -1096,15 +1147,30 @@ static int pipe_async_on(void)
 #else
         s_async_pipes = e && *e == '1';
 #endif
+        {
+            const char *se = getenv("RECOMP_GX_PIPE_SERIAL"), *we = getenv("RECOMP_GX_PIPE_WORKERS");
+            s_pipe_serial = se && *se == '1';
+            if (!se || !*se) {
+                /* Adreno 740 and newer with no setting from the game: one compile at a time
+                 * (both crash reports came from such GPUs; the Adreno 730 ran fine) */
+                const char *a = strstr(g_gx_gpu_desc, "Adreno");
+                const char *d = a ? strpbrk(a, "0123456789") : NULL;
+                if (d && d - a < 16 && atoi(d) >= 740) s_pipe_serial = 1;
+            }
+            s_pipe_workers = we && *we == '1' ? 1 : s_pipe_serial ? 1 : 2;
+            s_pipe_create_lock = SDL_CreateMutex();
+        }
         if (s_async_pipes) {
             s_job_lock = SDL_CreateMutex();
             s_job_cond = SDL_CreateCondition();
             if (!s_job_lock || !s_job_cond ||
                 !SDL_CreateThread(pipe_job_worker, "gx_pipe0", NULL) ||
-                !SDL_CreateThread(pipe_job_worker, "gx_pipe1", NULL))
+                (s_pipe_workers > 1 && !SDL_CreateThread(pipe_job_worker, "gx_pipe1", NULL)))
                 s_async_pipes = 0;
-            fprintf(stderr, "  [GX] background pipeline compiles %s\n", s_async_pipes ? "on" : "off");
         }
+        fprintf(stderr, "  [GX] background pipeline compiles %s (%d worker%s), one compile at a time: %s\n",
+                s_async_pipes ? "on" : "off", s_async_pipes ? s_pipe_workers : 0, s_pipe_workers == 1 ? "" : "s",
+                s_pipe_serial ? "yes" : "no");
     }
     return s_async_pipes;
 }
@@ -1185,6 +1251,25 @@ static void stencil_face(const D3D11_DEPTH_STENCILOP_DESC *s, SDL_GPUStencilOpSt
     o->compare_op = map_cmp(s->StencilFunc);
 }
 
+/* Into the lookup table; a full table starts over (rare). The old pipelines
+ * are released after the command list is recorded: draws already queued in
+ * it still refer to them. */
+static void pipe_insert(const GxPipeKey *k, uint32_t h, SDL_GPUGraphicsPipeline *p)
+{
+    uint32_t i;
+    if (s_npipes >= PIPE_CACHE * 3 / 4) {
+        for (i = 0; i < PIPE_CACHE; i++)
+            if (s_pipes[i].p) defer_release(DR_PIPE, s_pipes[i].p);
+        memset(s_pipes, 0, sizeof s_pipes);
+        s_npipes = 0;
+        fprintf(stderr, "  [GX] pipeline table full: starting over\n");
+    }
+    for (i = 0; i < PIPE_CACHE; i++) {
+        uint32_t s = (h + i) & (PIPE_CACHE - 1);
+        if (!s_pipes[s].p) { s_pipes[s].k = *k; s_pipes[s].h = h; s_pipes[s].p = p; s_npipes++; break; }
+    }
+}
+
 static SDL_GPUGraphicsPipeline *pipe_get(GxShader *vs, GxShader *ps, D3D11_PRIMITIVE_TOPOLOGY topo,
                                          const GxBlend *bl, const GxDss *dss, const GxRs *rs,
                                          const GxTex *rt, const GxTex *ds, const GxTex *rt2, const GxTex *rt3,
@@ -1220,6 +1305,7 @@ static SDL_GPUGraphicsPipeline *pipe_get(GxShader *vs, GxShader *ps, D3D11_PRIMI
         if (!s_pipes[s].p) break;
         if (s_pipes[s].h == h && !memcmp(&s_pipes[s].k, &k, sizeof k)) return s_pipes[s].p;
     }
+    if (s_nfailed && pipe_is_failed(&k, h)) return NULL;    /* the driver refused it: drop the draw, no hold */
     memset(&ci, 0, sizeof ci);
     memset(ct, 0, sizeof ct);
     ci.vertex_shader = vs->sh;
@@ -1292,11 +1378,17 @@ static SDL_GPUGraphicsPipeline *pipe_get(GxShader *vs, GxShader *ps, D3D11_PRIMI
         LARGE_INTEGER a, b, fq;
         SDL_GPUGraphicsPipeline *p = NULL;
         int from_job = 0;
-        if (pipe_async_on()) {
+        if (pipe_async_on() == 1) {
             int got = 0, freej = -1, wait = 4;
             SDL_LockMutex(s_job_lock);
             for (i = 0; i < PIPE_JOBS; i++) {
                 GxPipeJob *j = &s_jobs[i];
+                if (j->state == 3 && !(j->h == h && !memcmp(&j->k, &k, sizeof k))) {
+                    /* finished for another draw: into the table now, which frees the slot */
+                    if (j->p && !pipe_is_failed(&j->k, j->h)) pipe_insert(&j->k, j->h, j->p);
+                    j->p = NULL;
+                    j->state = 0;
+                }
                 if (!j->state) { if (freej < 0) freej = (int)i; continue; }
                 if (j->h == h && !memcmp(&j->k, &k, sizeof k)) {
                     if (j->state == 3) { p = j->p; j->state = 0; got = 1; }
@@ -1334,41 +1426,53 @@ static SDL_GPUGraphicsPipeline *pipe_get(GxShader *vs, GxShader *ps, D3D11_PRIMI
             SDL_UnlockMutex(s_job_lock);
             if (got < 0) {
                 InterlockedIncrement(&s_pipe_skips);  /* Present holds the last full frame */
+                InterlockedIncrement(&g_gx_pipe_skipped);
                 return NULL;                        /* draw skipped until it is ready */
             }
-            if (got > 0) {
-                if (!p) return NULL;
-                from_job = 1;
+            if (got > 0 && p) from_job = 1;
+            if (got > 0 && !p && g_gx_pipe_async_failed >= 6 && s_async_pipes == 1) {
+                /* a driver whose background compiles keep failing: compile at the draw from now on */
+                s_async_pipes = 2;
+                fprintf(stderr, "  [GX] %ld background pipeline compiles failed: background compiles off for this run\n",
+                        (long)g_gx_pipe_async_failed);
             }
-            /* no free job slot: compile here, as before */
+            /* failed in the background, or no free job slot: compile here */
         }
         QueryPerformanceCounter(&a);
         if (!from_job)
-            p = SDL_CreateGPUGraphicsPipeline(G.dev, &ci);
+            p = gx_create_pipeline(&ci);
+        if (!p && !from_job) {
+            /* the plainer variant: solid fill and depth clip on need no optional features */
+            SDL_GPUGraphicsPipelineCreateInfo safe = ci;
+            safe.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+            safe.rasterizer_state.enable_depth_clip = true;
+            if (memcmp(&safe.rasterizer_state, &ci.rasterizer_state, sizeof safe.rasterizer_state) &&
+                    (p = gx_create_pipeline(&safe)) != NULL) {
+                LONG n = InterlockedIncrement(&g_gx_pipe_safe);
+                if (n <= 8) fprintf(stderr, "  [GX] pipeline refused, the plainer variant works (fill %d, depth clip %d)\n",
+                                    (int)ci.rasterizer_state.fill_mode, (int)ci.rasterizer_state.enable_depth_clip);
+            }
+        }
         QueryPerformanceCounter(&b);
         QueryPerformanceFrequency(&fq);
         s_st.pipe_ms += (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)fq.QuadPart;
         g_gx_pipe_qpc += b.QuadPart - a.QuadPart;           /* the hitch log's "pipelines" */
         g_gx_pipes++;
         if (!p) {
-            static int told;
-            if (told++ < 8) fprintf(stderr, "  [GX] pipeline: %s\n", SDL_GetError());
+            LONG n = InterlockedIncrement(&g_gx_pipe_failed);
+            if (n <= 8)
+                fprintf(stderr, "  [GX] pipeline refused (%s): vs %u ps %u topology %u targets %u colour %u depth %u blend %d "
+                        "fill %d cull %d depth clip %d; its draws are dropped\n", SDL_GetError(), k.vs, k.ps, k.topo,
+                        ci.target_info.num_color_targets, k.cfmt, k.dfmt, (int)k.b.BlendEnable, (int)k.rs.FillMode,
+                        (int)k.rs.CullMode, (int)k.rs.DepthClipEnable);
+            if (s_nfailed < PIPE_FAILED) { s_failed[s_nfailed].k = k; s_failed[s_nfailed].h = h; s_nfailed++; }
             return NULL;
         }
         created++;
         if (created <= 3 || created % 200 == 0 || (b.QuadPart - a.QuadPart) * 1000 / fq.QuadPart > 30)
             fprintf(stderr, "  [GX] %u pipelines (last took %.1f ms)\n", created,
                     (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)fq.QuadPart);
-        if (s_npipes >= PIPE_CACHE * 3 / 4) {          /* full: start over (rare) */
-            for (i = 0; i < PIPE_CACHE; i++)
-                if (s_pipes[i].p) SDL_ReleaseGPUGraphicsPipeline(G.dev, s_pipes[i].p);
-            memset(s_pipes, 0, sizeof s_pipes);
-            s_npipes = 0;
-        }
-        for (i = 0; i < PIPE_CACHE; i++) {
-            uint32_t s = (h + i) & (PIPE_CACHE - 1);
-            if (!s_pipes[s].p) { s_pipes[s].k = k; s_pipes[s].h = h; s_pipes[s].p = p; s_npipes++; break; }
-        }
+        pipe_insert(&k, h, p);
         return p;
     }
 }
@@ -2015,6 +2119,7 @@ static void replay(SDL_GPUCommandBuffer *cb, uint32_t up_base)
                 bound = NULL;
                 if (!rp) break;
             }
+            if (!d->pipe) break;
             if (bound != d->pipe) { SDL_BindGPUGraphicsPipeline(rp, d->pipe); bound = d->pipe; }
             SDL_SetGPUViewport(rp, &d->vp);
             SDL_SetGPUBlendConstants(rp, d->bf);
@@ -2034,6 +2139,7 @@ static void replay(SDL_GPUCommandBuffer *cb, uint32_t up_base)
                 SDL_SetGPUScissor(rp, &d->sc[k]);
                 SDL_DrawGPUPrimitives(rp, d->n, 1, d->first, 0);
                 s_st.draws++;
+                s_draws_total++;
             }
             break;
         }
@@ -2621,6 +2727,49 @@ static void gx_pipe_cache_save(void)
 static void gx_pipe_cache_save(void) {}
 #endif
 
+/* The last frames, for the crash report: what the renderer was doing just
+ * before (new pipelines, failures, held frames, slow frames). */
+typedef struct { LONG frame, draws, made, failed, skipped, inflight, held; uint32_t ms10; } GxFrameRec;
+static GxFrameRec s_ring[16];
+static volatile LONG s_ring_n;
+
+static void frame_record(int held)
+{
+    static double last;
+    double now = qpc_ms();
+    GxFrameRec *r = &s_ring[s_ring_n & 15];
+    r->frame = (LONG)g_gx_presented_frames;
+    r->draws = s_draws_total;
+    r->made = g_gx_pipe_made;
+    r->failed = g_gx_pipe_failed + g_gx_pipe_async_failed;
+    r->skipped = g_gx_pipe_skipped;
+    r->inflight = s_jobs_inflight;
+    r->held = held;
+    r->ms10 = last > 0.0 && now - last < 600000.0 ? (uint32_t)((now - last) * 10.0) : 0;
+    last = now;
+    InterlockedIncrement(&s_ring_n);
+}
+
+/* Called from the crash handler (src/main.c): plain formatting only. */
+int gx_crash_summary(char *out, size_t n)
+{
+    int o, i, cnt = s_ring_n < 16 ? (int)s_ring_n : 16;
+    o = snprintf(out, n, "[CRASH] GPU: %s\n[CRASH] pipelines: %ld made, %ld refused, %ld failed in the background, "
+                 "%ld plainer variants, %ld draws waited; in the table %u, refused kept %u, compiling now %ld; "
+                 "background compiles %s, one at a time %s, workers %d; frames shown %ld\n",
+                 g_gx_gpu_desc[0] ? g_gx_gpu_desc : "(not made yet)", (long)g_gx_pipe_made, (long)g_gx_pipe_failed,
+                 (long)g_gx_pipe_async_failed, (long)g_gx_pipe_safe, (long)g_gx_pipe_skipped, s_npipes, s_nfailed,
+                 (long)s_jobs_inflight, s_async_pipes == 1 ? "on" : s_async_pipes == 2 ? "turned off" : "off",
+                 s_pipe_serial ? "yes" : "no", s_pipe_workers, (long)g_gx_presented_frames);
+    for (i = cnt; i > 0 && o > 0 && (size_t)o < n - 120; i--) {
+        const GxFrameRec *r = &s_ring[(s_ring_n - i) & 15];
+        o += snprintf(out + o, n - o, "[CRASH]   frame %ld: %.1f ms, draws %ld, pipelines made %ld, failed %ld, waits %ld, compiling %ld%s\n",
+                      (long)r->frame, r->ms10 / 10.0, (long)r->draws, (long)r->made, (long)r->failed, (long)r->skipped,
+                      (long)r->inflight, r->held ? " (held)" : "");
+    }
+    return o;
+}
+
 HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
 {
     GxSwap *sw = (GxSwap *)s;
@@ -2643,6 +2792,7 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
         if (InterlockedExchange(&s_pipe_skips, 0) && shown && held < 120) {
             held++;
             flush(1);
+            frame_record(1);
             return S_OK;
         }
         if (held) fprintf(stderr, "  [GX] held the last frame for %d frames while pipelines compiled\n", held);
@@ -2680,6 +2830,7 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
     if (sct) {
         GxTex *first = pair ? sw->bb2 : sw->bb;
         g_gx_presented_frames++;
+        frame_record(0);
         present_blit(s_cb, first->t, first->d.Width, first->d.Height, sct, w, h);
     }
     flush(1);
@@ -2732,6 +2883,16 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
                 s_st.flush_ms / 300.0, s_st.copy_ms / 300.0, s_st.replay_ms / 300.0, s_st.submit_ms / 300.0,
                 s_st.acquire_ms / 300.0, s_st.pipe_ms / 300.0, s_st.mvt_draws / 300.0, s_st.mv_draws / 300.0, s_tb_size >> 20, s_st.staged_tex / 300.0 / 1048576.0, s_st.staged_vb / 300.0 / 1048576.0, s_st.uni_bytes / 300.0 / 1024.0);
         memset(&s_st, 0, sizeof s_st);
+        {
+            static LONG last_sum = -1;
+            LONG sum = g_gx_pipe_made + g_gx_pipe_failed * 7 + g_gx_pipe_async_failed * 13 + g_gx_pipe_skipped * 3;
+            if (sum != last_sum) {
+                last_sum = sum;
+                fprintf(stderr, "  [GX] pipelines: %ld made, %ld refused, %ld failed in the background, %ld plainer, "
+                        "%ld draws waited, compiling now %ld\n", (long)g_gx_pipe_made, (long)g_gx_pipe_failed,
+                        (long)g_gx_pipe_async_failed, (long)g_gx_pipe_safe, (long)g_gx_pipe_skipped, (long)s_jobs_inflight);
+            }
+        }
     }
     return S_OK;
 }
