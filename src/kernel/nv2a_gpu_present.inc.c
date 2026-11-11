@@ -297,6 +297,10 @@ static struct {
 static volatile LONG s_menu_open;
 volatile LONG g_xbox_input_blocked;      /* nfl2k5_input_hle.c: game input off while the menu is up */
 static int s_menu_sel;
+/* A page longer than this scrolls (the Music Player's song list): the rows
+ * from s_menu_top are drawn, LT/RT (Home/End) jump a page. */
+#define MENU_VISIBLE 14
+static int s_menu_top;
 
 /* GX_SDL (Vulkan/Direct3D 12, gx/gx_sdl.c): SDL_GPU's register spaces, and
  * the point-sampled read of Src as its own texture-sampler slot (SrcP). */
@@ -1117,6 +1121,18 @@ void xbox_MenuInvalidate(void) { s_pr.ovl_valid = 0; }
 int xbox_MenuIsOpen(void) { return s_menu_open != 0; }
 static const XboxMenuPage *menu_page(void) { return s_pages[s_menu_page % s_npages]; }
 static int menu_rows(void) { int n = menu_page()->count(); return n > 0 ? n : 1; }
+static int menu_shown(void) { int n = menu_rows(); return n > MENU_VISIBLE ? MENU_VISIBLE : n; }
+/* Keep the selection on the page and in view (a page's length can change). */
+static void menu_scroll(void)
+{
+    int n = menu_rows();
+    if (s_menu_sel >= n) s_menu_sel = n - 1;
+    if (s_menu_sel < 0) s_menu_sel = 0;
+    if (s_menu_sel < s_menu_top) s_menu_top = s_menu_sel;
+    if (s_menu_sel >= s_menu_top + MENU_VISIBLE) s_menu_top = s_menu_sel - MENU_VISIBLE + 1;
+    if (s_menu_top > n - menu_shown()) s_menu_top = n - menu_shown();
+    if (s_menu_top < 0) s_menu_top = 0;
+}
 
 /* ---- the in-game Video Settings screen ----------------------------------
  * src/nfl2k5_video_menu.c adds "Video Settings" to the game's own Options
@@ -1408,11 +1424,14 @@ static void menu_key(unsigned vk)
         case VK_LEFT:   if (pg->change) pg->change(s_menu_sel, -1); break;
         case VK_RIGHT:  if (pg->change) pg->change(s_menu_sel, 1); break;
         case VK_RETURN: case VK_SPACE: if (pg->activate) pg->activate(s_menu_sel); break;
-        case VK_PRIOR:  s_menu_page = (s_menu_page + s_npages - 1) % s_npages; s_menu_sel = 0; break;
-        case VK_NEXT:   s_menu_page = (s_menu_page + 1) % s_npages; s_menu_sel = 0; break;
+        case VK_PRIOR:  s_menu_page = (s_menu_page + s_npages - 1) % s_npages; s_menu_sel = s_menu_top = 0; break;
+        case VK_NEXT:   s_menu_page = (s_menu_page + 1) % s_npages; s_menu_sel = s_menu_top = 0; break;
+        case VK_HOME:   s_menu_sel = s_menu_sel - MENU_VISIBLE < 0 ? 0 : s_menu_sel - MENU_VISIBLE; break;
+        case VK_END:    s_menu_sel = s_menu_sel + MENU_VISIBLE >= rows ? rows - 1 : s_menu_sel + MENU_VISIBLE; break;
         case VK_ESCAPE: InterlockedExchange(&s_menu_open, 0); InterlockedExchange(&g_xbox_input_blocked, 0); break;
         default: return;
         }
+        menu_scroll();
     }
     s_pr.ovl_valid = 0;
 }
@@ -1421,7 +1440,9 @@ static void menu_key(unsigned vk)
 static void menu_pad(void)
 {
     static WORD prev;
-    static DWORD repeat_at;
+    static DWORD repeat_at, held_since;
+    static int prev_lt, prev_rt;
+    int lt, rt;
     XBOX_INPUT_STATE st;
     WORD b, down;
     /* The title's controller layer (any pad, remapped) when it has one. */
@@ -1438,8 +1459,11 @@ static void menu_pad(void)
     if (st.Gamepad.bAnalogButtons[4] > 128) b |= 0x4000;   /* LB (Black) */
     if (st.Gamepad.bAnalogButtons[5] > 128) b |= 0x8000;   /* RB (White) */
     down = (WORD)(b & ~prev);
+    lt = st.Gamepad.bAnalogButtons[6] > 128;
+    rt = st.Gamepad.bAnalogButtons[7] > 128;
     if (s_menu_open && menu_page()->busy && menu_page()->busy()) {   /* the page reads the pad itself */
         prev = b;
+        prev_lt = lt; prev_rt = rt;
         return;
     }
     if ((b & 0x30) == 0x30 && (down & 0x30)) {             /* Back + Start */
@@ -1449,10 +1473,15 @@ static void menu_pad(void)
     }
     if (s_menu_open) {
         DWORD now = GetTickCount();
-        if (b & 0x0F) {                                     /* held d-pad repeats */
-            if (down & 0x0F) repeat_at = now + 350;
-            else if (now >= repeat_at) { down |= (WORD)(b & 0x0F); repeat_at = now + 90; }
+        if (b & 0x0F) {                                     /* held d-pad repeats, faster the longer */
+            if (down & 0x0F) { repeat_at = now + 350; held_since = now; }
+            else if (now >= repeat_at) {
+                down |= (WORD)(b & 0x0F);
+                repeat_at = now + (now - held_since > 2500 ? 25 : now - held_since > 1200 ? 50 : 90);
+            }
         }
+        if (lt && !prev_lt) menu_key(VK_HOME);              /* LT / RT: a page of a long list */
+        if (rt && !prev_rt) menu_key(VK_END);
         if (down & 0x01) menu_key(VK_UP);
         if (down & 0x02) menu_key(VK_DOWN);
         if (down & 0x04) menu_key(VK_LEFT);
@@ -1463,6 +1492,7 @@ static void menu_pad(void)
         if (down & 0x8000) menu_key(VK_NEXT);
     }
     prev = b;
+    prev_lt = lt; prev_rt = rt;
 }
 
 /* Draw the page (or just the FPS counter) with GDI into a BGRA bitmap and
@@ -1471,7 +1501,7 @@ static void menu_pad(void)
 static void pr_build_overlay(void)
 {
     /* Tall enough for the open page's rows (32 px each), at least the old 560. */
-    const int W = 760, H = s_menu_open && 90 + menu_rows() * 32 + 80 > 560 ? 90 + menu_rows() * 32 + 80 : 560;
+    const int W = 760, H = s_menu_open && 90 + menu_shown() * 32 + 80 > 560 ? 90 + menu_shown() * 32 + 80 : 560;
     BITMAPINFO bi;
     void *bits = NULL;
     HDC dc;
@@ -1516,9 +1546,25 @@ static void pr_build_overlay(void)
             TextOutA(dc, W - 40 - ps.cx, 36, pg, (int)strlen(pg));
         }
         SelectObject(dc, fs);
-        for (i = 0; i < menu_rows(); i++) {
+        menu_scroll();
+        if (menu_rows() > MENU_VISIBLE) {           /* a long page: where the view is */
+            HBRUSH track = CreateSolidBrush(RGB(40, 50, 75)), thumb = CreateSolidBrush(RGB(170, 20, 30));
+            int th = MENU_VISIBLE * 32, ty = 88, tl = th * MENU_VISIBLE / menu_rows();
+            int tp = ty + (th - (tl < 16 ? 16 : tl)) * s_menu_top / (menu_rows() - MENU_VISIBLE);
+            RECT tr2 = { W - 30, ty, W - 24, ty + th }, thr = { W - 30, tp, W - 24, tp + (tl < 16 ? 16 : tl) };
+            char pos[48];
+            SIZE ps2;
+            FillRect(dc, &tr2, track);
+            FillRect(dc, &thr, thumb);
+            DeleteObject(track); DeleteObject(thumb);
+            SetTextColor(dc, RGB(140, 150, 170));
+            snprintf(pos, sizeof pos, "%d / %d   LT / RT: page", s_menu_sel + 1, menu_rows());
+            GetTextExtentPoint32A(dc, pos, (int)strlen(pos), &ps2);
+            TextOutA(dc, W - 50 - ps2.cx, H - 56, pos, (int)strlen(pos));
+        }
+        for (i = s_menu_top; i < s_menu_top + menu_shown(); i++) {
             char name[64], val[96];
-            int y = 90 + i * 32;
+            int y = 90 + (i - s_menu_top) * 32;
             name[0] = val[0] = 0;
             menu_page()->label(i, name, val, sizeof val);
             if (i == s_menu_sel) {
@@ -1536,7 +1582,8 @@ static void pr_build_overlay(void)
             }
         }
         SetTextColor(dc, RGB(140, 150, 170));
-        TextOutA(dc, 50, H - 56, "Arrows / D-pad: choose   Left/Right: change   Enter / A: select", 64);
+        if (menu_rows() > MENU_VISIBLE) TextOutA(dc, 50, H - 56, "D-pad: choose   Left/Right: change   A: select", 46);
+        else TextOutA(dc, 50, H - 56, "Arrows / D-pad: choose   Left/Right: change   Enter / A: select", 64);
         SelectObject(dc, of);
         DeleteObject(panel); DeleteObject(bar); DeleteObject(selb);
     }
@@ -1613,7 +1660,7 @@ static void pt_upload(const uint32_t *bits, int W, int H, ID3D11Texture2D **tex,
 
 static void pr_build_overlay(void)
 {
-    const int W = 760, H = s_menu_open && 90 + menu_rows() * 32 + 80 > 560 ? 90 + menu_rows() * 32 + 80 : 560;
+    const int W = 760, H = s_menu_open && 90 + menu_shown() * 32 + 80 > 560 ? 90 + menu_shown() * 32 + 80 : 560;
     uint32_t *p = (uint32_t *)calloc((size_t)W * H, 4);
     int i;
     if (!p) return;
@@ -1628,9 +1675,19 @@ static void pr_build_overlay(void)
             snprintf(pg, sizeof pg, "LB/RB page %d of %d", s_menu_page % s_npages + 1, s_npages);
             pt_text(p, W, H, W - 40 - pt_width(pg, 2), 40, 2, pg, 300, 0xFFFFFFFFu);
         }
-        for (i = 0; i < menu_rows(); i++) {
+        menu_scroll();
+        if (menu_rows() > MENU_VISIBLE) {           /* a long page: where the view is */
+            int th = MENU_VISIBLE * 32, tl = th * MENU_VISIBLE / menu_rows();
+            char pos[48];
+            if (tl < 16) tl = 16;
+            pt_fill(p, W, H, W - 30, 88, 6, th, 0xFF284B4Bu);
+            pt_fill(p, W, H, W - 30, 88 + (th - tl) * s_menu_top / (menu_rows() - MENU_VISIBLE), 6, tl, 0xFFAA141Eu);
+            snprintf(pos, sizeof pos, "%d/%d LT/RT page", s_menu_sel + 1, menu_rows());
+            pt_text(p, W, H, W - 50 - pt_width(pos, 2), H - 30, 2, pos, 300, 0xFF8C96AAu);
+        }
+        for (i = s_menu_top; i < s_menu_top + menu_shown(); i++) {
             char name[64], val[96], v2[104];
-            int y = 90 + i * 32, vw;
+            int y = 90 + (i - s_menu_top) * 32, vw;
             uint32_t col = i == s_menu_sel ? 0xFFFFD23Cu : 0xFFE1E6F0u;
             name[0] = val[0] = 0;
             menu_page()->label(i, name, val, sizeof val);
