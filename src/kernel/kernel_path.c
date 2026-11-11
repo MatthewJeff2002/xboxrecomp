@@ -960,11 +960,29 @@ static void user_make_parents(char *path)
         }
 }
 
+/* A settings file the player does not have yet starts as the release's
+ * "<name>.default.ini" (0.8.1). The release ships only the .default copies,
+ * so unzipping a new version over the folder never writes over the player's
+ * own nfl2k5_video.ini or mods\presentation.ini (portable folders included). */
+static void user_seed_default(const char *rel, const char *dst)
+{
+    char def[MAX_PATH];
+    const char *dot = strrchr(rel, '.');
+    if (!dot || _stricmp(dot, ".ini") || (size_t)(dot - rel) + 13 >= sizeof def)
+        return;
+    if (GetFileAttributesA(dst) != INVALID_FILE_ATTRIBUTES)
+        return;
+    snprintf(def, sizeof def, "%.*s.default.ini", (int)(dot - rel), rel);
+    if (GetFileAttributesA(def) != INVALID_FILE_ATTRIBUTES)
+        CopyFileA(def, dst, TRUE);
+}
+
 /* `rel` (e.g. "cache\\ps\\x.bin") -> out. Returns out. */
 char *xbox_user_path(const char *rel, char *out, size_t n)
 {
     if (!s_user_dir[0]) {
         snprintf(out, n, "%s", rel);
+        user_seed_default(rel, rel);
         return out;
     }
     snprintf(out, n, "%s\\%s", s_user_dir, rel);
@@ -972,6 +990,7 @@ char *xbox_user_path(const char *rel, char *out, size_t n)
     if (GetFileAttributesA(out) == INVALID_FILE_ATTRIBUTES && GetFileAttributesA(rel) != INVALID_FILE_ATTRIBUTES &&
         !(GetFileAttributesA(rel) & FILE_ATTRIBUTE_DIRECTORY))
         CopyFileA(rel, out, TRUE);                 /* one-time migration of an existing file */
+    user_seed_default(rel, out);
     return out;
 }
 #else
