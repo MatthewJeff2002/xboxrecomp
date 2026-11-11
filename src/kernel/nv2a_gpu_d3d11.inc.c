@@ -811,11 +811,23 @@ static void gpu_flush_range(uint32_t addr, uint32_t bytes)
 
 /* ---- textures -------------------------------------------------------- */
 
+/* Mip levels of the texture being looked up (gpu_texture_lookup): a DXT
+ * texture's levels are read from guest memory right after level 0, so its
+ * bytes -- what is hashed for changes and flushed from render targets -- are
+ * the whole chain, not level 0 alone (0.8.1). */
+static uint32_t s_tex_levels = 1;
+
 static uint32_t gpu_tex_bytes(const Texture *t)
 {
     uint32_t b = d3d8_format_dxt_block_bytes(t->color);
-    if (b)
-        return (t->width / 4u) * (t->height / 4u) * b;
+    if (b) {
+        uint32_t len = 0, w = t->width, h = t->height, l;
+        for (l = 0; l < (s_tex_levels ? s_tex_levels : 1u); l++) {
+            len += ((w + 3) / 4) * ((h + 3) / 4) * b;
+            w = w > 1 ? w / 2 : 1; h = h > 1 ? h / 2 : 1;
+        }
+        return len;
+    }
     if (t->pitch && !tex_size_from_format(t->color))
         return t->pitch * t->height;
     return t->width * t->height * (t->color == 0x0B || t->color == 0x00 || t->color == 0x13 ? 1u : 4u);
@@ -983,9 +995,15 @@ static uint32_t gpu_cube_face_bytes(int st, const Texture *t)
 static uint32_t gpu_guest_levels(int st, const Texture *t)
 {
     uint32_t fmtreg = s_tex_reg[(0x1B04 + 0x40u * (uint32_t)st - NV_TEX_FIRST) / 4];
-    uint32_t levels = (fmtreg >> 16) & 0xF, l = 1;
+    uint32_t ctl0 = s_tex_reg[(0x1B0C + 0x40u * (uint32_t)st - NV_TEX_FIRST) / 4];
+    uint32_t levels = (fmtreg >> 16) & 0xF, l = 1, maxlod;
     if (env_cached("RECOMP_NO_MIPS") || levels <= 1) return 1;
     while (l < levels && l < 14 && ((t->width >> l) || (t->height >> l))) l++;
+    /* 0.8.1: the stage's max-LOD clamp (TEXTURE_CONTROL0 bits 6-17, 4.8 fixed
+     * point, as xemu reads it). The hardware never samples below it; the
+     * bytes there may belong to something else entirely. */
+    maxlod = ((ctl0 >> 6) & 0xFFFu) >> 8;
+    if (!env_cached("RECOMP_NO_LOD_CLAMP") && maxlod + 1u < l) l = maxlod + 1u;
     return l;
 }
 
@@ -1349,6 +1367,7 @@ static ID3D11ShaderResourceView *gpu_texture_lookup(int st, int cube)
             }
         }
     }
+    s_tex_levels = cube ? 1u : gpu_guest_levels(st, t);   /* the hash and flush cover the whole chain */
     gpu_flush_range(t->offset, gpu_tex_bytes(t));     /* render-to-texture */
     /* Hashed by identity, probed over a short run; the oldest slot of the run
      * is the victim. In-game NFL 2K5 binds far more than the old 256-entry
@@ -2156,6 +2175,40 @@ static int gpu_draw_batch_unlocked(int flat2d)
     return r;
 }
 
+/* The built-in widescreen's stretch F (VA 0x10254), or 0 when the patch is
+ * absent or F is 1 (menus). */
+static float gpu_ws_stretch(void)
+{
+    const float *k = (const float *)((const uint8_t *)xbox_GetMemoryOffset() + 0x10254u);
+    return k[3] == 40.0f && k[4] == 680.0f && k[5] == 720.0f && k[0] > 1.01f && k[0] < 3.0f ? k[0] : 0.0f;
+}
+
+/* Is this small batch a fill over the whole (squeezed) picture? Positions
+ * through the CPU vertex path, in fractions of the surface. Returns the
+ * width in whole-frame units (wf, ~1.0 / ~0.89), or 0. */
+static float gpu_wide_fill_shape(const XfVert *(*get)(uint32_t), const uint16_t *ix, uint32_t n,
+                                 uint32_t rw, uint32_t rh, float F)
+{
+    float W = (float)(rw + 2u * g_draw_ox), H = (float)rh;
+    float mnx = 1e30f, mxx = -1e30f, mny = 1e30f, mxy = -1e30f, wf;
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        const XfVert *v = get(ix[i]);
+        float x, y;
+        if (!v->ok) return 0.0f;
+        x = (vp_screen_coord(v->x) + (float)g_draw_ox) / W; y = vp_screen_coord(v->y) / H;
+        if (x < mnx) mnx = x; if (x > mxx) mxx = x;
+        if (y < mny) mny = y; if (y > mxy) mxy = y;
+    }
+    wf = (mxx - mnx) * F;
+    if (env_cached("RECOMP_WIDE_FILL_LOG") && mny < 0.1f && mxy > 0.9f) {
+        static int logged;
+        if (logged++ < 60)
+            fprintf(stderr, "  [WIDEFILL] n %u prim %u x %.3f..%.3f y %.3f..%.3f F %.3f wf %.3f\n", n, s_gpu.prim, mnx, mxx, mny, mxy, F, wf);
+    }
+    return wf > 0.85f && wf < 1.03f && fabsf((mnx + mxx) * 0.5f - 0.5f) < 0.02f && mny < 0.04f && mxy > 0.96f ? wf : 0.0f;
+}
+
 static int gpu_draw_batch_unlocked_body(int flat2d)
 {
     const uint16_t *ix = s_gpu.idx;
@@ -2169,6 +2222,7 @@ static int gpu_draw_batch_unlocked_body(int flat2d)
     const XfVert *(*get)(uint32_t);
     ID3D11VertexShader *vpvs = NULL;     /* the program on the GPU (RECOMP_GPU_VP) */
     UINT first_vertex = 0;                /* where this batch sits in the vertex ring */
+    int wide_fill = 0;                    /* a full-screen fill to widen (gpu_wide_fill_shape) */
     uint32_t vp_nverts = 0;
     LARGE_INTEGER cpu_vp_t0 = { 0 }, cpu_vp_t1;
     int profile_cpu_vp = 0;
@@ -2208,6 +2262,12 @@ static int gpu_draw_batch_unlocked_body(int flat2d)
         s_vp.batches++;
         if (gpu_vp_enabled())
             vpvs = gpu_vp_shader();
+        /* the fill between plays is a vertex-program quad: test its shape on
+         * the CPU path and, when it is one, draw it there to widen it */
+        if (vpvs && !lines && n >= 3 && n <= 6 && !env_cached("RECOMP_NO_WIDE_FILL")) {
+            float F = gpu_ws_stretch();
+            if (F > 0.0f && gpu_wide_fill_shape(get, ix, n, rw, rh, F) > 0.0f) { vpvs = NULL; wide_fill = 1; }
+        }
     }
     if (vpvs) {
         { uint64_t a = DP_NOW();
@@ -2281,6 +2341,38 @@ static int gpu_draw_batch_unlocked_body(int flat2d)
 #undef GPU_LINE
     if (!nv)
         return 1;
+    /* 0.8.1: the built-in widescreen patch (VA 0x10254) draws all 2D at 4:3
+     * size in the middle of the picture, so a fill meant for the whole screen
+     * -- the fade/flash between plays -- covered only a middle box (players:
+     * "a darkened box in the middle between plays", worst at 21:9). A 2D fill
+     * centred on the picture, as wide as the whole 4:3 frame squeezed by F and
+     * as tall as the picture, is widened back over the whole width. HUD art
+     * (scorebug, text, panels) never has that shape. RECOMP_NO_WIDE_FILL=1 off. */
+    if ((flat2d || wide_fill) && !vpvs && !lines && nv >= 6 && nv <= 192 && !env_cached("RECOMP_NO_WIDE_FILL")) {
+        const float *k = (const float *)((const uint8_t *)xbox_GetMemoryOffset() + 0x10254u);
+        float F = k[0];
+        if (k[3] == 40.0f && k[4] == 680.0f && k[5] == 720.0f && F > 1.01f && F < 3.0f) {
+            float W = (float)(rw + 2u * g_draw_ox), H = (float)rh;
+            float mnx = 1e30f, mxx = -1e30f, mny = 1e30f, mxy = -1e30f, wf;
+            for (i = 0; i < nv; i++) {
+                float x = s_gpu11.verts[i].rawscreen[0] / W, y = s_gpu11.verts[i].rawscreen[1] / H;
+                if (x < mnx) mnx = x; if (x > mxx) mxx = x;
+                if (y < mny) mny = y; if (y > mxy) mxy = y;
+            }
+            wf = (mxx - mnx) * F;                    /* 1.0 = the whole 720 frame, 0.89 = the 640 action area */
+            if (wf > 0.85f && wf < 1.03f && fabsf((mnx + mxx) * 0.5f - 0.5f) < 0.02f && mny < 0.04f && mxy > 0.96f) {
+                static int told;
+                for (i = 0; i < nv; i++) {
+                    GpuVertex *v = &s_gpu11.verts[i];
+                    float cx = W * 0.5f;
+                    v->rawscreen[0] = (v->rawscreen[0] - cx) * (F / wf) + cx;
+                    v->pos[0] = (v->rawscreen[0] / W * 2.0f - 1.0f) * v->pos[3];
+                }
+                if (told++ < 4)
+                    fprintf(stderr, "  [GPU] widescreen: a full-screen 2D fill (%.0f%% of the frame) widened over the picture\n", wf * 100.0f);
+            }
+        }
+    }
     /* RECOMP_GPU_SKIP_BLEND=SSSS/DDDD (hex GL enums): drop blended draws
      * with that blend pair -- isolates an overlay pass while debugging. */
     if (env_cached("RECOMP_GPU_SKIP_BLEND") && s_gpu.blend) {
