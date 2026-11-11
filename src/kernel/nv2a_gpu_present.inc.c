@@ -26,6 +26,23 @@ extern void *xbox_FramebufferWindowHwnd(void);
 extern void xbox_FramebufferSetGpuPresent(int on);
 extern void xbox_FramebufferSetKeyHook(void (*hook)(unsigned vk));
 extern void xbox_FramebufferApplyMode(int mode, int w, int h);
+extern int xbox_FramebufferExclusiveState(void);       /* video/fb_present.c: 1 on, -1 mode unavailable */
+extern const char *xbox_FramebufferExclusiveNote(void);
+#if defined(_WIN32) && !defined(NFL2K5_UWP) && !defined(XBOX_GX_PORTABLE)
+#define PR_GX_FALLBACK 1                                /* Direct3D 12 / Vulkan can give way to Direct3D 11 */
+extern char g_gx_fallback_reason[256];                  /* gx/gx_sdl.c */
+extern volatile long g_gx_presented_frames;
+int gx_present_trouble(char *why, size_t n);
+void gx_present_trouble_reset(void);
+#endif
+static int pr_exclusive_state(void)
+{
+#ifdef PR_GX_FALLBACK
+    return xbox_FramebufferExclusiveState();
+#else
+    return 0;
+#endif
+}
 
 #include <SDL3/SDL.h>
 
@@ -176,8 +193,9 @@ static void vs_save(void)
                "scale = %d\n"
                "; filter: 0 bilinear, 1 sharp bilinear, 2 nearest, 3 enhanced\n"
                "filter = %d\nvsync = %d\nbrightness = %d\ngamma = %d\ncrop = %d\nshow_fps = %d\naniso = %d\n"
-               "; fps_limit: 30 locks 30; 60, 120 and 0 (unlimited) lock 60 in every camera (the game\n"
-               "; simulates at most 60 frames a second); -1 original: the game's own 30/60 per camera\n"
+               "; fps_limit: 30 locks 30; 60 locks 60 in every camera; -1 original: the game's own 30/60\n"
+               "; per camera. The game simulates at most 60 frames a second, so there is no 120 or unlimited\n"
+               "; (older 120 and 0 values act as 60). More frames on screen: framegen (Direct3D 12).\n"
                "fps_limit = %d\n"
                "; widescreen: 1 fills the screen with a wider view (built-in widescreen), 0 the original 4:3 picture\n"
                "widescreen = %d\n"
@@ -307,8 +325,13 @@ static const char k_present_hlsl[] =
      * The 5-tap filters below read one texel apart, so at 16x on a 1440-line
      * screen they used ~4 of the ~28 pixels drawn for each one shown, and
      * the picture shimmered like a far lower scale (2026-10-29). */
+    /* 0.8.1: every shrink, not only above 1.5x. At the default 3x on a
+     * 1080p screen (2160x1440 -> 1920x1080, 1.1-1.3x) the picture went
+     * through the sharpening 5-tap filter below, which over a shrinking
+     * picture brings out stair-steps: the yard lines and crowd shimmered
+     * as the camera moved. */
     "  float2 ssr = sz.xy * src.zw / max(sz.zw, 1.0);\n"
-    "  if ((prm.z == 0.0 || prm.z == 3.0) && max(ssr.x, ssr.y) > 1.5) {\n"
+    "  if ((prm.z == 0.0 || prm.z == 3.0) && max(ssr.x, ssr.y) > 1.02) {\n"
     "    int2 n = (int2)clamp(ceil(ssr * 0.5), 1.0, 8.0);\n"
     "    float2 st = ssr / (float2)n / sz.xy, o = uv - st * ((float2)n - 1.0) * 0.5; float4 a = 0;\n"
     "    [loop] for (int y = 0; y < n.y; y++) [loop] for (int x = 0; x < n.x; x++) a += Src.SampleLevel(Lin, o + st * float2(x, y), 0);\n"
@@ -636,6 +659,16 @@ static int pr_swapchain(void)
 static void pr_apply_mode(void)
 {
     int want_fs = s_vs.mode == VM_FULLSCREEN;
+#ifdef PR_GX_FALLBACK
+    if (g_gx_sg) {
+        /* Direct3D 12 / Vulkan: SDL owns the swap chain (no DXGI exclusive
+         * mode): exclusive = the display switched to the chosen resolution
+         * by SDL (video/fb_present.c, mode 3); borderless when it cannot be. */
+        xbox_FramebufferApplyMode(want_fs ? 3 : s_vs.mode, s_vs.res_w, s_vs.res_h);
+        gx_present_trouble_reset();
+        return;
+    }
+#endif
     if (s_pr.sc && s_pr.fullscreen_state && !want_fs) {
         IDXGISwapChain1_SetFullscreenState(s_pr.sc, FALSE, NULL);
         s_pr.fullscreen_state = 0;
@@ -827,8 +860,14 @@ static const float k_upscaler_ratio[] = { 1.0f, 1.0f, 1.5f, 1.7f, 2.0f, 3.0f };
 static UINT s_fsr_out_h;                 /* last upscale's output height, 0 when off */
 static const char *const k_api_names[] = { "Direct3D 11", "Vulkan", "Direct3D 12" };
 static const char *const k_perf_overlay_names[] = { "Off", "FPS only", "Full" };   /* show_fps */
-static const int k_fps_limits[] = { 30, 60, 120, 0, -1 };
-#define FPS_LIMITS 5
+/* 0.8.1: only caps that exist. The game simulates at most 60 frames a second,
+ * so "120" and "Unlimited" (0.8.0) both locked 60 -- players read them as a
+ * promise of more. 120 and 0 from an older settings file still load and act
+ * as before (a 60 lock); they show as 60. More than 60 on screen comes only
+ * from Frame Generation (Direct3D 12, off by default). */
+static const int k_fps_limits[] = { 30, 60, -1 };
+#define FPS_LIMITS 3
+#define FPS_LIMIT_INDEX_60 1
 /* The title's frame-interval hook (src/main.c) re-reads the cap when it
  * changes, so a new setting applies at once rather than at the game's next
  * camera change. */
@@ -896,7 +935,11 @@ static void menu_label(int item, char *name, char *val, size_t n)
     val[0] = 0;
     switch (item) {
     case MI_PRESET: strcpy(name, "Graphics preset"); snprintf(val, n, "%s", k_preset_names[preset_current(&s_vs)]); break;
-    case MI_MODE:   strcpy(name, "Display mode"); snprintf(val, n, "%s", modes[s_vs.mode % 3]); break;
+    case MI_MODE:   strcpy(name, "Display mode");
+                    if (s_vs.mode == VM_FULLSCREEN && pr_exclusive_state() < 0)
+                        snprintf(val, n, "Exclusive: not available, borderless");
+                    else snprintf(val, n, "%s", modes[s_vs.mode % 3]);
+                    break;
     case MI_RES:    strcpy(name, s_vs.mode == VM_BORDERLESS ? "Resolution (desktop)" : "Resolution");
                     snprintf(val, n, "%d x %d", s_vs.res_w, s_vs.res_h); break;
     case MI_ASPECT: strcpy(name, "Aspect ratio"); snprintf(val, n, "%s", aspects[s_vs.aspect % 6]); break;
@@ -924,15 +967,23 @@ static void menu_label(int item, char *name, char *val, size_t n)
     case MI_WIDE:   strcpy(name, "Widescreen"); snprintf(val, n, "%s", s_vs.widescreen ? "On" : "Off"); break;
     case MI_LIMIT:  strcpy(name, "Frame rate cap");
                     if (s_vs.fps_limit < 0) snprintf(val, n, "Original (30/60)");
-                    else snprintf(val, n, s_vs.fps_limit ? "%d" : "Unlimited", s_vs.fps_limit); break;
+                    else if (s_vs.fps_limit == 30) snprintf(val, n, "30");
+                    else snprintf(val, n, "60 (the game's maximum)");
+                    break;
     case MI_API:    strcpy(name, "Graphics API");
+#ifdef PR_GX_FALLBACK
+                    if (s_vs.renderer && !g_gx_sg && g_gx_fallback_reason[0]) {
+                        snprintf(val, n, "%s  (not available here: Direct3D 11 in use)", k_api_names[s_vs.renderer % 3]);
+                        break;
+                    }
+#endif
                     snprintf(val, n, "%s%s", k_api_names[s_vs.renderer % 3],
                              strcmp(k_api_names[s_vs.renderer % 3], gx_backend_name()) ? "  (after restart)" : ""); break;
     case MI_UPSCALE: strcpy(name, "Upscaling");
                     snprintf(val, n, "%s%s", k_upscaler_names[s_vs.upscaler % 6],
                              s_vs.upscaler && !gxs_fsr_available() ? "  (Direct3D 12 only)" : ""); break;
     case MI_FRAMEGEN: strcpy(name, "Frame generation");
-                    snprintf(val, n, "%s%s", s_vs.framegen ? "FSR 3 (2x frames)" : "Off",
+                    snprintf(val, n, "%s%s", s_vs.framegen ? "FSR 3: up to 120 shown, game still 60" : "Off",
                              s_vs.framegen && !gxs_fsr_available() ? "  (Direct3D 12 only)" : ""); break;
     case MI_RESET:  strcpy(name, "Reset to defaults"); break;
 #ifdef __ANDROID__
@@ -981,7 +1032,7 @@ static void menu_change(int item, int dir)
     case MI_WIDE:   s_vs.widescreen = !s_vs.widescreen; break;
     case MI_LIMIT:  { int k;
                       for (k = 0; k < FPS_LIMITS && k_fps_limits[k] != s_vs.fps_limit; k++) {}
-                      k = (k >= FPS_LIMITS ? 3 : (k + FPS_LIMITS + dir) % FPS_LIMITS); s_vs.fps_limit = k_fps_limits[k];
+                      k = (k >= FPS_LIMITS ? FPS_LIMIT_INDEX_60 : (k + FPS_LIMITS + dir) % FPS_LIMITS); s_vs.fps_limit = k_fps_limits[k];
                       fps_limit_changed(); } break;
     case MI_API:    s_vs.renderer = (s_vs.renderer + 3 + dir) % 3; break;
     case MI_UPSCALE: s_vs.upscaler = (s_vs.upscaler + 6 + dir) % 6; break;
@@ -1171,7 +1222,7 @@ static int vm_get(const VideoSettings *vs, int item)
     case MI_LIMIT:
         for (k = 0; k < FPS_LIMITS; k++)
             if (k_fps_limits[k] == vs->fps_limit) return k;
-        return 3;
+        return FPS_LIMIT_INDEX_60;                     /* 120 / 0 from older settings: a 60 lock */
     case MI_API:    return vs->renderer;
     case MI_UPSCALE: return vs->upscaler;
     case MI_FRAMEGEN: return vs->framegen;
@@ -1211,7 +1262,7 @@ static void vm_set(VideoSettings *vs, int item, int idx)
 
 void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
 {
-    static const char *modes[] = { "Windowed", "Borderless", "Fullscreen" };
+    static const char *modes[] = { "Windowed", "Borderless", "Exclusive" };
     static const char *aspects[] = { "Fill Screen", "Stretch", "16:9 Bars", "21:9 Wide",
                                      "32:9 Wide", "Zoom to Fill" };
     static const char *filters[] = { "Bilinear", "Sharp Bilinear", "Nearest", "Enhanced Sharp" };
@@ -1224,7 +1275,8 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
     vm_set(&v, item, idx);
     switch (item) {
     case MI_PRESET: snprintf(buf, n, "%s", k_preset_names[idx >= 0 && idx <= 4 ? idx : 0]); break;
-    case MI_MODE:   snprintf(buf, n, "%s", modes[v.mode % 3]); break;
+    case MI_MODE:   snprintf(buf, n, "%s", v.mode == VM_FULLSCREEN && s_vs.mode == VM_FULLSCREEN && pr_exclusive_state() < 0
+                                         ? "Exclusive (borderless)" : modes[v.mode % 3]); break;
     case MI_RES:    snprintf(buf, n, "%d x %d", v.res_w, v.res_h); break;
     case MI_ASPECT: snprintf(buf, n, "%s", aspects[v.aspect % 6]); break;
     case MI_SCALE:
@@ -1246,7 +1298,9 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
     case MI_FPS:    snprintf(buf, n, "%s", k_perf_overlay_names[v.show_fps % 3]); break;
     case MI_WIDE:   snprintf(buf, n, "%s", v.widescreen ? "On" : "Off"); break;
     case MI_LIMIT:  if (v.fps_limit < 0) snprintf(buf, n, "Original (30/60)");
-                    else if (v.fps_limit) snprintf(buf, n, "%d FPS", v.fps_limit); else snprintf(buf, n, "Unlimited"); break;
+                    else if (v.fps_limit == 30) snprintf(buf, n, "30 FPS");
+                    else snprintf(buf, n, "60 FPS (the maximum)");
+                    break;
     case MI_API:    snprintf(buf, n, "%s%s", k_api_names[v.renderer % 3],
                              strcmp(k_api_names[v.renderer % 3], gx_backend_name()) ? " (restart)" : ""); break;
     case MI_UPSCALE: snprintf(buf, n, "%s", k_upscaler_names[v.upscaler % 6]); break;
@@ -1843,6 +1897,103 @@ static float pr_wanted_wide_ar(void)
 }
 
 /* Present the surface at guest address `guest`. Returns 1 when it did. */
+#ifdef PR_GX_FALLBACK
+/* Direct3D 12 / Vulkan cannot show the game here: say why, switch the
+ * setting to Direct3D 11 and start the game again (the renderer is chosen at
+ * start). Never a black or grey window that plays sound (0.8.0 reports). */
+static void pr_renderer_fallback(const char *why)
+{
+    static LONG once;
+    wchar_t exe[MAX_PATH], wwhy[400], msg[1400], wlog[MAX_PATH], *cmd;
+    char logp[MAX_PATH];
+    const char *api = gx_backend_name();
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    if (InterlockedExchange(&once, 1))
+        return;
+    fprintf(stderr, "[GX-FALLBACK] %s; the setting is now Direct3D 11 and the game restarts\n", why);
+    fflush(stderr);
+    s_vs.renderer = 0;
+    vs_save();
+    if (!MultiByteToWideChar(CP_UTF8, 0, why, -1, wwhy, 400)) wcscpy(wwhy, L"(no reason given)");
+    xbox_user_path("logs\\session.log", logp, sizeof logp);
+    if (!MultiByteToWideChar(CP_ACP, 0, logp, -1, wlog, MAX_PATH)) wcscpy(wlog, L"logs\\session.log");
+    _snwprintf(msg, sizeof msg / sizeof msg[0] - 1,
+               L"%hs could not show the game on this PC:\n\n%ls\n\n"
+               L"The game will now restart with Direct3D 11, which works on every supported PC. "
+               L"You can choose the Graphics API again later in F1 > Video.\n\n"
+               L"If you report this, send the log:\n%ls", api, wwhy, wlog);
+    msg[sizeof msg / sizeof msg[0] - 1] = 0;
+    if (!getenv("NFL2K5_TEST_NO_DIALOGS"))
+        MessageBoxW(NULL, msg, L"ESPN NFL 2K5 - graphics", MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+    SetEnvironmentVariableW(L"RECOMP_RENDERER", L"d3d11");
+    SetEnvironmentVariableW(L"NFL2K5_RENDERER_FALLBACK", wwhy);
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    cmd = _wcsdup(GetCommandLineW());
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    if (cmd && CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    } else
+        fprintf(stderr, "[GX-FALLBACK] could not restart the game (error %lu); start it again\n", (unsigned long)GetLastError());
+    fflush(stderr);
+    ExitProcess(3);
+}
+
+/* Once a frame: anything keeping the picture off the screen (gx_sdl.c)? */
+static void pr_gx_watchdog(void)
+{
+    static int fs_done, told;
+    char why[320];
+    int t;
+    {   /* what the player is told after a fallback at start */
+        static int shown;
+        if (!shown) {
+            const char *prev = getenv("NFL2K5_RENDERER_FALLBACK");
+            shown = 1;
+            if (prev && *prev) {
+                fprintf(stderr, "  [VIDEO] running on Direct3D 11 after a fallback: %s\n", prev);
+                xbox_PresentToast("GRAPHICS", "Switched to Direct3D 11 (the other API showed no picture)",
+                                  "The reason is in logs\\session.log", 12000);
+            } else if (!g_gx_sg && g_gx_fallback_reason[0]) {
+                xbox_PresentToast("GRAPHICS", s_vs.renderer == 1 ? "Vulkan is not available on this PC"
+                                                                 : "Direct3D 12 is not available on this PC",
+                                  "Using Direct3D 11 (reason in logs\\session.log)", 12000);
+            }
+        }
+    }
+    if (!g_gx_sg)
+        return;
+    t = gx_present_trouble(why, sizeof why);
+    if (getenv("NFL2K5_TEST_GX_TROUBLE") && g_gx_presented_frames > 120) {   /* tests: force a case */
+        t = atoi(getenv("NFL2K5_TEST_GX_TROUBLE"));
+        snprintf(why, sizeof why, "trouble %d forced for a test", t);
+    }
+    if (!t)
+        return;
+    if (t == 1 && s_vs.mode == VM_FULLSCREEN && !fs_done) {
+        fs_done = 1;
+        fprintf(stderr, "  [VIDEO] exclusive fullscreen: %s; switched to borderless fullscreen\n", why);
+        s_vs.mode = VM_BORDERLESS;
+        vs_save();
+        InterlockedExchange(&s_vs_dirty, 1);
+        gx_present_trouble_reset();
+        xbox_PresentToast("VIDEO", "Exclusive fullscreen showed no picture here",
+                          "Switched to borderless fullscreen (F1 > Video)", 10000);
+        return;
+    }
+    if (t == 2 || g_gx_presented_frames == 0) {
+        pr_renderer_fallback(why);
+        return;
+    }
+    /* frames did reach the screen before: a covered window, not a broken renderer */
+    if (!told++)
+        fprintf(stderr, "  [VIDEO] %s (window covered?); watching\n", why);
+    gx_present_trouble_reset();
+}
+#endif
+
 static int pr_present(uint32_t guest)
 {
     gpu_state_invalidate();     /* binds its own state: the next draw resends all */
@@ -1861,6 +2012,9 @@ static int pr_present(uint32_t guest)
         if (s_gpu11.surf[i].tex && s_gpu11.surf[i].guest == guest) { s = &s_gpu11.surf[i]; break; }
     if (!s)
         return 0;
+#ifdef PR_GX_FALLBACK
+    pr_gx_watchdog();
+#endif
     if (!pr_swapchain())
         return 0;
     if (!s_pr.ok)

@@ -146,6 +146,13 @@ static struct {
  * GPU that is behind shows up here first. */
 static volatile LONGLONG s_gpu_wait_us;
 volatile long g_gx_presented_frames;    /* reached the swap chain (the driver trial, src/nfl2k5_gpu_driver.c) */
+/* 0.8.1: why Direct3D 12 / Vulkan could not be used (start-up self-test,
+ * window claim, nothing reaching the screen); the game shows it and falls
+ * back to Direct3D 11 (nv2a_gpu_present.inc.c). */
+char g_gx_fallback_reason[256];
+static volatile LONG s_pipe_ok, s_pipe_failed;   /* pipelines the driver made / refused */
+static char s_pipe_first_error[160];
+static char s_claim_error[160];
 LONGLONG gxs_gpu_wait_total_us(void) { return s_gpu_wait_us; }
 
 static double qpc_ms(void)
@@ -319,11 +326,116 @@ static void gx_vk_find_unregistered_drivers(void)
 }
 #endif
 
+/* Start-up self-test (0.8.1): before the game draws anything, prove that this
+ * GPU and driver take what the renderer will hand it -- a hardware adapter, a
+ * shader compiled the way every game shader is (DXC, signed by dxil.dll for
+ * Direct3D 12) and a pipeline for the swap chain's format. Any failure here
+ * means a black screen later, so the caller falls back to Direct3D 11 with
+ * the reason in the log and on screen. */
+static int gx_selftest(int backend, char *why, size_t n)
+{
+    static const char hlsl[] =
+        "float4 st_vs(uint id : SV_VertexID) : SV_Position {\n"
+        "  float2 p = float2((id << 1) & 2, id & 2);\n"
+        "  return float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+        "}\n"
+        "float4 st_ps() : SV_Target0 { return float4(0.0, 0.0, 0.0, 1.0); }\n";
+    void *code[2] = { NULL, NULL };
+    size_t len[2] = { 0, 0 };
+    SDL_GPUShader *sh[2] = { NULL, NULL };
+    SDL_GPUGraphicsPipeline *pipe = NULL;
+    char msg[512];
+    int i, ok = 0;
+    {
+        SDL_PropertiesID dp = SDL_GetGPUDeviceProperties(G.dev);
+        const char *nm = dp ? SDL_GetStringProperty(dp, SDL_PROP_GPU_DEVICE_NAME_STRING, "") : "";
+        fprintf(stderr, "  [GX] GPU: %s\n", nm && *nm ? nm : "(name not reported)");
+        if (nm && (SDL_strcasestr(nm, "Basic Render") || SDL_strcasestr(nm, "WARP") ||
+                   SDL_strcasestr(nm, "llvmpipe") || SDL_strcasestr(nm, "SwiftShader"))) {
+            snprintf(why, n, "only a software adapter (%s) was offered, no graphics card", nm);
+            return 0;
+        }
+    }
+    for (i = 0; i < 2; i++) {
+        GxReflect r;
+        memset(&r, 0, sizeof r);
+        if (!gx_dxc_compile(hlsl, sizeof hlsl - 1, i ? "st_ps" : "st_vs", i ? "ps_6_0" : "vs_6_0", backend == 1, 0,
+                            &code[i], &len[i], msg, sizeof msg, &r)) {
+            snprintf(why, n, "the shader compiler failed: %.180s", msg);
+            goto done;
+        }
+    }
+    for (i = 0; i < 2; i++) {
+        SDL_GPUShaderCreateInfo ci;
+        memset(&ci, 0, sizeof ci);
+        ci.code = (const Uint8 *)code[i];
+        ci.code_size = len[i];
+        ci.entrypoint = i ? "st_ps" : "st_vs";
+        ci.format = backend == 1 ? SDL_GPU_SHADERFORMAT_SPIRV : SDL_GPU_SHADERFORMAT_DXIL;
+        ci.stage = i ? SDL_GPU_SHADERSTAGE_FRAGMENT : SDL_GPU_SHADERSTAGE_VERTEX;
+        if (!(sh[i] = SDL_CreateGPUShader(G.dev, &ci))) {
+            snprintf(why, n, "the driver refused a shader: %.180s", SDL_GetError());
+            goto done;
+        }
+    }
+    {
+        SDL_GPUGraphicsPipelineCreateInfo pci;
+        SDL_GPUColorTargetDescription ct;
+        memset(&pci, 0, sizeof pci);
+        memset(&ct, 0, sizeof ct);
+        ct.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+        ct.blend_state.color_write_mask = 0xF;
+        pci.vertex_shader = sh[0];
+        pci.fragment_shader = sh[1];
+        pci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+        pci.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+        pci.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+        pci.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        pci.target_info.num_color_targets = 1;
+        pci.target_info.color_target_descriptions = &ct;
+        if (!(pipe = SDL_CreateGPUGraphicsPipeline(G.dev, &pci))) {
+            snprintf(why, n, "the driver refused a pipeline: %.180s", SDL_GetError());
+            goto done;
+        }
+    }
+    ok = 1;
+done:
+    if (pipe) SDL_ReleaseGPUGraphicsPipeline(G.dev, pipe);
+    for (i = 0; i < 2; i++) {
+        if (sh[i]) SDL_ReleaseGPUShader(G.dev, sh[i]);
+        free(code[i]);
+    }
+    return ok;
+}
+
+/* dxil.dll signs Direct3D 12 shaders; without it next to the exe (or with a
+ * different version than dxcompiler.dll) every pipeline is refused. */
+static int gx_dxil_present(char *why, size_t n)
+{
+    wchar_t path[MAX_PATH];
+    DWORD k = GetModuleFileNameW(NULL, path, MAX_PATH);
+    while (k && path[k - 1] != L'\\' && path[k - 1] != L'/') k--;
+    path[k] = 0;
+    if (k + 9 < MAX_PATH) wcscat(path, L"dxil.dll");
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+        snprintf(why, n, "dxil.dll is missing from the game folder (it must sit next to NFL2K5.exe)");
+        return 0;
+    }
+    return 1;
+}
+
 static int gx_sdl_init(int backend)
 {
     SDL_PropertiesID p;
-    if (!gx_dxc_available())
+    if (!gx_dxc_available()) {
+        snprintf(g_gx_fallback_reason, sizeof g_gx_fallback_reason,
+                 "dxcompiler.dll is missing from the game folder (it must sit next to NFL2K5.exe)");
         return 0;
+    }
+#ifndef XBOX_GX_PORTABLE
+    if (backend == 2 && !gx_dxil_present(g_gx_fallback_reason, sizeof g_gx_fallback_reason))
+        return 0;
+#endif
 #ifndef XBOX_GX_PORTABLE
     if (backend == 1)
         gx_vk_find_unregistered_drivers();
@@ -365,8 +477,21 @@ static int gx_sdl_init(int backend)
     SDL_DestroyProperties(p);
     if (!G.dev) {
         fprintf(stderr, "  [GX] %s device failed: %s\n", backend == 1 ? "Vulkan" : "Direct3D 12", SDL_GetError());
+        snprintf(g_gx_fallback_reason, sizeof g_gx_fallback_reason, "%s is not supported by this graphics card or driver (%.160s)",
+                 backend == 1 ? "Vulkan" : "Direct3D 12", SDL_GetError());
         return 0;
     }
+    if (getenv("NFL2K5_TEST_GX_SELFTEST_FAIL") ||
+        !gx_selftest(backend, g_gx_fallback_reason, sizeof g_gx_fallback_reason)) {
+        if (getenv("NFL2K5_TEST_GX_SELFTEST_FAIL"))
+            snprintf(g_gx_fallback_reason, sizeof g_gx_fallback_reason, "self-test failure forced for a test");
+        fprintf(stderr, "  [GX] %s self-test failed: %s\n", backend == 1 ? "Vulkan" : "Direct3D 12", g_gx_fallback_reason);
+        SDL_DestroyGPUDevice(G.dev);
+        G.dev = NULL;
+        return 0;
+    }
+    fprintf(stderr, "  [GX] %s self-test passed (shader compile, driver shader, pipeline)\n",
+            backend == 1 ? "Vulkan" : "Direct3D 12");
     InitializeCriticalSection(&G.create_lock);
     InitializeCriticalSection(&G.submit_lock);
     G.depth_fmt = SDL_GPUTextureSupportsFormat(G.dev, SDL_GPU_TEXTUREFORMAT_D32_FLOAT_S8_UINT, SDL_GPU_TEXTURETYPE_2D,
@@ -392,7 +517,11 @@ HRESULT gx_D3D11CreateDevice(IDXGIAdapter *ad, D3D_DRIVER_TYPE dt, HMODULE sw, U
             g_gx_sg = 1;
             gx_sdl_defaults();
         } else {
-            if (chosen) fprintf(stderr, "  [GX] falling back to Direct3D 11\n");
+            if (chosen) {
+                if (!g_gx_fallback_reason[0])
+                    snprintf(g_gx_fallback_reason, sizeof g_gx_fallback_reason, "%s could not start", chosen == 1 ? "Vulkan" : "Direct3D 12");
+                fprintf(stderr, "  [GX] falling back to Direct3D 11: %s\n", g_gx_fallback_reason);
+            }
             s_backend = 0;
             g_gx_sg = 0;
         }
@@ -1352,9 +1481,12 @@ static SDL_GPUGraphicsPipeline *pipe_get(GxShader *vs, GxShader *ps, D3D11_PRIMI
         g_gx_pipes++;
         if (!p) {
             static int told;
+            if (!s_pipe_first_error[0]) snprintf(s_pipe_first_error, sizeof s_pipe_first_error, "%s", SDL_GetError());
+            InterlockedIncrement(&s_pipe_failed);
             if (told++ < 8) fprintf(stderr, "  [GX] pipeline: %s\n", SDL_GetError());
             return NULL;
         }
+        InterlockedIncrement(&s_pipe_ok);
         created++;
         if (created <= 3 || created % 200 == 0 || (b.QuadPart - a.QuadPart) * 1000 / fq.QuadPart > 30)
             fprintf(stderr, "  [GX] %u pipelines (last took %.1f ms)\n", created,
@@ -2286,6 +2418,7 @@ static int gx_presenter(void *window, int letterbox)
                     SDL_WindowSupportsGPUSwapchainComposition(G.dev, G.win, SDL_GPU_SWAPCHAINCOMPOSITION_HDR_EXTENDED_LINEAR) ? "yes" : "no");
         } else {
             fprintf(stderr, "  [GX] could not claim the window: %s\n", SDL_GetError());
+            snprintf(s_claim_error, sizeof s_claim_error, "%s", SDL_GetError());
             InterlockedExchange(&G.claimed, -1);
             return 0;
         }
@@ -2621,6 +2754,39 @@ static void gx_pipe_cache_save(void)
 static void gx_pipe_cache_save(void) {}
 #endif
 
+/* Presents in a row whose picture did not reach the screen (no swap-chain
+ * image while the window is shown), counted by Present. */
+static volatile LONG s_no_frame;
+
+/* 0.8.1: is anything keeping the picture off the screen? Polled once a frame
+ * by pr_present (nv2a_gpu_present.inc.c), which decides what to do.
+ *   0  all well
+ *   1  the last ~3 s of presents reached no screen (the window is shown)
+ *   2  this renderer cannot show the game at all: the window could not be
+ *      claimed, or the driver refused every pipeline it was given
+ * `why` gets a sentence for the log and the message. */
+int gx_present_trouble(char *why, size_t n)
+{
+    if (!g_gx_sg) return 0;
+    if (G.claimed < 0) {
+        snprintf(why, n, "%s could not take over the game window (%s)", gx_backend_name(),
+                 s_claim_error[0] ? s_claim_error : "no reason given");
+        return 2;
+    }
+    if (s_pipe_failed >= 40 && s_pipe_ok == 0) {
+        snprintf(why, n, "the graphics driver refused every %s pipeline (%ld tried; first error: %s)", gx_backend_name(),
+                 (long)s_pipe_failed, s_pipe_first_error[0] ? s_pipe_first_error : "none given");
+        return 2;
+    }
+    if (s_no_frame >= 180) {
+        snprintf(why, n, "%s showed no picture for %ld frames in a row", gx_backend_name(), (long)s_no_frame);
+        return 1;
+    }
+    return 0;
+}
+
+void gx_present_trouble_reset(void) { InterlockedExchange(&s_no_frame, 0); }
+
 HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
 {
     GxSwap *sw = (GxSwap *)s;
@@ -2676,6 +2842,11 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
         ta = qpc_ms() - ta;
         s_st.acquire_ms += ta;
         InterlockedAdd64(&s_gpu_wait_us, (LONGLONG)(ta * 1000.0));
+    }
+    {   /* watchdog: presents that never reach the screen (gx_present_trouble) */
+        SDL_WindowFlags wf = SDL_GetWindowFlags(G.win);
+        if (sct) s_no_frame = 0;
+        else if (!(wf & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN | SDL_WINDOW_OCCLUDED))) s_no_frame++;
     }
     if (sct) {
         GxTex *first = pair ? sw->bb2 : sw->bb;

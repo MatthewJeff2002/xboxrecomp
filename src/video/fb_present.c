@@ -21,8 +21,19 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 enum {
     FB_MODE_WINDOWED = 0,
     FB_MODE_BORDERLESS = 1,
-    FB_MODE_FULLSCREEN = 2
+    FB_MODE_FULLSCREEN = 2,
+    /* 0.8.1: fullscreen at the chosen resolution through SDL (the display is
+     * switched to that mode). The Direct3D 12 / Vulkan renderers use this:
+     * their swap chain belongs to SDL, so DXGI's own exclusive mode (what
+     * Direct3D 11 does in nv2a_gpu_present.inc.c) is not available there. */
+    FB_MODE_EXCLUSIVE_SDL = 3
 };
+/* 1 the display runs the chosen mode, -1 that mode could not be set (the
+ * window is borderless fullscreen at the desktop mode instead), 0 not asked */
+static SDL_AtomicInt s_exclusive_state;
+static char s_exclusive_note[96];
+int xbox_FramebufferExclusiveState(void) { return SDL_GetAtomicInt(&s_exclusive_state); }
+const char *xbox_FramebufferExclusiveNote(void) { return s_exclusive_note; }
 Uint64 gpu_expected_until;
 
 
@@ -132,6 +143,30 @@ static void fb_convert(const uint8_t *src, uint32_t pitch, uint32_t bpp) {
 }
 
 static void fb_apply_mode_sdl(SDL_Window *win, int mode, int w, int h) {
+    if (getenv("NFL2K5_TEST_OFFSCREEN"))       /* tests: never cover the screen */
+        mode = FB_MODE_WINDOWED;
+    if (mode == FB_MODE_EXCLUSIVE_SDL) {
+        SDL_DisplayID d = SDL_GetDisplayForWindow(win);
+        SDL_DisplayMode dm;
+        const SDL_DisplayMode *desk = d ? SDL_GetDesktopDisplayMode(d) : NULL;
+        g_fb.mode = FB_MODE_FULLSCREEN;
+        SDL_zero(dm);
+        if (d && w > 0 && h > 0 && SDL_GetClosestFullscreenDisplayMode(d, w, h, desk ? desk->refresh_rate : 0.0f, true, &dm) &&
+            dm.w == w && dm.h == h && SDL_SetWindowFullscreenMode(win, &dm) && SDL_SetWindowFullscreen(win, true)) {
+            SDL_SetAtomicInt(&s_exclusive_state, 1);
+            s_exclusive_note[0] = 0;
+            fprintf(stderr, "  [FBWIN] exclusive fullscreen %dx%d @ %.2f Hz\n", dm.w, dm.h, dm.refresh_rate);
+            return;
+        }
+        snprintf(s_exclusive_note, sizeof s_exclusive_note, "%dx%d is not a mode of this display", w, h);
+        fprintf(stderr, "  [FBWIN] exclusive fullscreen %dx%d not available (%s); borderless fullscreen instead\n",
+                w, h, SDL_GetError());
+        SDL_SetAtomicInt(&s_exclusive_state, -1);
+        SDL_SetWindowFullscreenMode(win, NULL);
+        SDL_SetWindowFullscreen(win, true);
+        return;
+    }
+    SDL_SetAtomicInt(&s_exclusive_state, 0);
     g_fb.mode = mode;
     if (mode == FB_MODE_WINDOWED) {
         g_fb.client_w = w;
@@ -272,6 +307,8 @@ static int SDLCALL fb_thread_sdl(void *data) {
     g_fb.apply_mode_event = SDL_RegisterEvents(1);
 
     flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    if (getenv("NFL2K5_TEST_OFFSCREEN"))       /* tests beside someone using the PC: no focus, off the screen */
+        flags |= SDL_WINDOW_NOT_FOCUSABLE;
     g_fb.mode = FB_MODE_WINDOWED;
     g_fb.client_w = (int) g_fb.width;
     g_fb.client_h = (int) g_fb.height;
@@ -309,6 +346,8 @@ static int SDLCALL fb_thread_sdl(void *data) {
     SDL_UnlockRWLock(g_fb.rgb_lock);
 
     g_fb.window = win;
+    if (getenv("NFL2K5_TEST_OFFSCREEN"))
+        SDL_SetWindowPosition(win, -4000, 100);
 
     fprintf(stderr, "  [FBWIN] Unified SDL3 window active (%ux%u surface, scale %.2f)\n",
             g_fb.width, g_fb.height, SDL_GetWindowDisplayScale(win));
